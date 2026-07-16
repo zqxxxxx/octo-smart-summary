@@ -174,7 +174,8 @@ func (n *Notifier) deliverToRecipient(task model.SummaryTask, kind, errMsg strin
 
 	// 2) Build + deliver.
 	text := n.buildText(task, kind, errMsg)
-	deliverErr := n.deliver(task.ID, target, text)
+	card := n.buildSummaryCardFields(task, kind, errMsg)
+	deliverErr := n.deliver(task.ID, target, text, card)
 
 	// 3) Persist outcome.
 	if deliverErr == nil {
@@ -247,7 +248,7 @@ func (n *Notifier) claimRetry(taskID int64, kind, uid string) (bool, error) {
 	return res.RowsAffected == 1, nil
 }
 
-func (n *Notifier) deliver(taskID int64, target deliveryTarget, text string) error {
+func (n *Notifier) deliver(taskID int64, target deliveryTarget, text string, card *SummaryCardFields) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -288,11 +289,64 @@ func (n *Notifier) deliver(taskID int64, target deliveryTarget, text string) err
 		ChannelID:   target.ChannelID,
 		ChannelType: target.ChannelType,
 		Payload:     payload,
+		Card:        card,
 	}
 	if err := n.deliverer.SendMessage(ctx, target.SpaceID, msg); err != nil {
 		return fmt.Errorf("sendMessage: %w", err)
 	}
 	return nil
+}
+
+// buildSummaryCardFields maps durable Summary state to the cross-repository
+// structured ingress contract. It never builds Adaptive Card JSON: layout,
+// localized labels, actions, and /s/{task_id}?sp={space_id} are server-owned.
+func (n *Notifier) buildSummaryCardFields(task model.SummaryTask, kind, errMsg string) *SummaryCardFields {
+	title := strings.TrimSpace(task.Title)
+	if title == "" {
+		// octo-server requires a non-empty title. TaskNo is stable and language
+		// neutral, unlike inventing client-owned localized card copy here.
+		title = strings.TrimSpace(task.TaskNo)
+	}
+	if strings.TrimSpace(task.TaskNo) == "" || title == "" {
+		// Old/corrupt rows cannot satisfy the structured contract. Returning nil
+		// keeps the legacy text path available instead of turning a notification
+		// into a permanent 400/retry loop.
+		return nil
+	}
+
+	meta := n.resultMeta(task)
+	card := &SummaryCardFields{
+		TaskID:      task.ID,
+		TaskNo:      strings.TrimSpace(task.TaskNo),
+		SummaryMode: task.SummaryMode,
+		Kind:        kind,
+		Title:       title,
+		TimeRange:   formatTimeRange(task),
+		Members:     n.participantCount(task),
+		MsgCount:    meta.msgCount,
+	}
+	if !meta.generatedAt.IsZero() {
+		card.GeneratedAt = timezone.In(meta.generatedAt).Format("2006-01-02 15:04")
+	}
+	if kind == model.NotifyKindCompleted {
+		card.Content = truncateSummaryCardContent(meta.content)
+	} else if kind == model.NotifyKindFailed {
+		card.Reason = n.safeFailureReason(errMsg)
+	}
+	return card
+}
+
+// Keep the cross-service request comfortably below the card payload ceiling
+// even for CJK text (up to four UTF-8 bytes per rune). octo-server repeats the
+// same defensive bound before authoring the Adaptive Card document.
+func truncateSummaryCardContent(content string) string {
+	const maxRunes = 6000
+	content = strings.TrimSpace(content)
+	runes := []rune(content)
+	if len(runes) <= maxRunes {
+		return content
+	}
+	return string(runes[:maxRunes-1]) + "…"
 }
 
 // recipientIsActiveMember reports whether uid is an active member (status=1) of
@@ -425,20 +479,27 @@ func (n *Notifier) buildText(task model.SummaryTask, kind, errMsg string) string
 		// via the synchronous worker path (OnTaskTerminal) or the sweep/redeliver
 		// path that reloads task.ErrorMessage raw from DB — is scrubbed here before
 		// it can reach the user DM. See WithErrorSanitizer / PR#113 R3.
-		if reason := strings.TrimSpace(errMsg); reason != "" {
-			safe := reason
-			if n.errorSanitizer != nil {
-				safe = n.errorSanitizer(reason)
-			} else {
-				// Defensive: never leak raw internals if no sanitizer wired.
-				safe = "AI 处理失败，请稍后重试"
-			}
+		if safe := n.safeFailureReason(errMsg); safe != "" {
 			fmt.Fprintf(&b, "\n失败原因：%s", safe)
 		}
 		return b.String()
 	default:
 		return ""
 	}
+}
+
+// safeFailureReason is the single render-point sanitizer shared by the text
+// fallback and structured card fields. Raw worker/DB errors must never cross
+// the notification boundary.
+func (n *Notifier) safeFailureReason(errMsg string) string {
+	reason := strings.TrimSpace(errMsg)
+	if reason == "" {
+		return ""
+	}
+	if n.errorSanitizer != nil {
+		return strings.TrimSpace(n.errorSanitizer(reason))
+	}
+	return "AI 处理失败，请稍后重试"
 }
 
 // resolveSpaceName looks up the human-readable space name for the task's
@@ -468,6 +529,7 @@ func (n *Notifier) resolveSpaceName(task model.SummaryTask) string {
 type notifyResultMeta struct {
 	generatedAt time.Time
 	msgCount    int
+	content     string
 }
 
 // resultMeta best-effort loads the completed task's summary_result row for the
@@ -481,16 +543,17 @@ func (n *Notifier) resultMeta(task model.SummaryTask) notifyResultMeta {
 	var row struct {
 		GeneratedAt   time.Time
 		TotalMsgCount int
+		Content       string
 	}
 	// Latest version wins if a result was regenerated. Read-only single row.
 	if err := n.db.Raw(
-		"SELECT generated_at, total_msg_count FROM summary_result WHERE task_id = ? ORDER BY version DESC, id DESC LIMIT 1",
+		"SELECT generated_at, total_msg_count, content FROM summary_result WHERE task_id = ? ORDER BY version DESC, id DESC LIMIT 1",
 		task.ID,
 	).Scan(&row).Error; err != nil {
 		log.Printf("[notify] task=%d: resultMeta query failed: %v", task.ID, err)
 		return notifyResultMeta{}
 	}
-	return notifyResultMeta{generatedAt: row.GeneratedAt, msgCount: row.TotalMsgCount}
+	return notifyResultMeta{generatedAt: row.GeneratedAt, msgCount: row.TotalMsgCount, content: row.Content}
 }
 
 // participantCount best-effort counts the participants of a by-person task for
@@ -667,7 +730,8 @@ func (n *Notifier) redeliver(taskID int64, kind, uid string) {
 		errMsg = *task.ErrorMessage
 	}
 	text := n.buildText(task, kind, errMsg)
-	if deliverErr := n.deliver(taskID, target, text); deliverErr != nil {
+	card := n.buildSummaryCardFields(task, kind, errMsg)
+	if deliverErr := n.deliver(taskID, target, text, card); deliverErr != nil {
 		n.markFailed(taskID, kind, uid, deliverErr)
 		log.Printf("[notify] sweep: task=%d kind=%s uid=%s delivery failed: %v", taskID, kind, uid, sanitize(deliverErr.Error()))
 		return

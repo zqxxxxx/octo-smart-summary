@@ -36,14 +36,33 @@ type Deliverer interface {
 	SendMessage(ctx context.Context, spaceID string, msg SendMessageRequest) error
 }
 
-// SendMessageRequest is the state-machine-internal message shape. deliver()
-// fills ChannelID with the recipient uid, ChannelType=WireChannelDM, and Payload
-// with the IM-recognized shape {type:1, content:text, space_id?}. The
-// InternalNotifyDeliverer forwards Payload verbatim into the NotifyReq.
+// SummaryCardFields mirrors octo-server modules/notify.SummaryCardFields. It
+// carries business data only; octo-server owns the Adaptive Card document,
+// localized labels, actions, and deep link.
+type SummaryCardFields struct {
+	TaskID      int64  `json:"task_id"`
+	TaskNo      string `json:"task_no"`
+	SummaryMode int    `json:"summary_mode"`
+	Kind        string `json:"kind"`
+	Title       string `json:"title"`
+	TimeRange   string `json:"time_range"`
+	Members     int    `json:"members"`
+	MsgCount    int    `json:"msg_count"`
+	GeneratedAt string `json:"generated_at"`
+	Content     string `json:"content"`
+	Reason      string `json:"reason"`
+}
+
+// SendMessageRequest is the state-machine-internal message shape. Payload is
+// retained as an in-process plain-text fallback/diagnostic representation so
+// existing callers and tests keep their safe text. When Card is non-nil the
+// HTTP transport sends ONLY NotifyReq.card; payload and card are never mixed on
+// the wire.
 type SendMessageRequest struct {
-	ChannelID   string         `json:"channel_id"`
-	ChannelType int            `json:"channel_type"`
-	Payload     map[string]any `json:"payload"`
+	ChannelID   string             `json:"channel_id"`
+	ChannelType int                `json:"channel_type"`
+	Payload     map[string]any     `json:"payload"`
+	Card        *SummaryCardFields `json:"card,omitempty"`
 }
 
 // oboReservedKeys are OBO markers that must never appear in a payload.
@@ -68,12 +87,13 @@ func payloadHasOBOReserved(payload map[string]any) bool {
 // One request carries exactly one recipient in Targets so the state machine's
 // per-recipient dedup/retry granularity is preserved.
 type notifyReq struct {
-	SpaceID  string         `json:"space_id"`
-	Service  string         `json:"service"`
-	Event    string         `json:"event"`
-	Targets  []string       `json:"targets"`
-	ActorUID string         `json:"actor_uid"`
-	Payload  map[string]any `json:"payload"`
+	SpaceID  string             `json:"space_id"`
+	Service  string             `json:"service"`
+	Event    string             `json:"event"`
+	Targets  []string           `json:"targets"`
+	ActorUID string             `json:"actor_uid"`
+	Payload  map[string]any     `json:"payload,omitempty"`
+	Card     *SummaryCardFields `json:"card,omitempty"`
 }
 
 const (
@@ -120,10 +140,9 @@ type notifyResp struct {
 	Filtered  map[string]string `json:"filtered"`
 }
 
-// SendMessage posts one recipient's message to /v1/internal/notify. Payload is
-// forwarded verbatim: octo-server passes it straight to the IM message builder,
-// which requires the {type:1, content} shape — reshaping it here would render an
-// empty message under a 2xx and silently lose the notification.
+// SendMessage posts one recipient's message to /v1/internal/notify. Structured
+// Summary notifications send Card only. Legacy text notifications forward
+// Payload verbatim in the IM-recognized {type:1, content} shape.
 func (d *InternalNotifyDeliverer) SendMessage(ctx context.Context, spaceID string, msg SendMessageRequest) error {
 	if payloadHasOBOReserved(msg.Payload) {
 		return fmt.Errorf("notify payload contains forbidden OBO reserved field")
@@ -133,7 +152,7 @@ func (d *InternalNotifyDeliverer) SendMessage(ctx context.Context, spaceID strin
 	for k, v := range msg.Payload {
 		payload[k] = v
 	}
-	if d.webBaseURL != "" {
+	if msg.Card == nil && d.webBaseURL != "" {
 		payload["result_url"] = d.webBaseURL
 	}
 
@@ -151,7 +170,11 @@ func (d *InternalNotifyDeliverer) SendMessage(ctx context.Context, spaceID strin
 		Event:    "",
 		Targets:  []string{msg.ChannelID}, // single recipient — keep per-uid granularity
 		ActorUID: "",
-		Payload:  payload,
+	}
+	if msg.Card != nil {
+		req.Card = msg.Card
+	} else {
+		req.Payload = payload
 	}
 	return d.post(ctx, notifyEndpoint, req, msg.ChannelID)
 }

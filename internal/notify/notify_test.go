@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -127,6 +128,12 @@ func TestOnTaskTerminal_CompletedDelivers(t *testing.T) {
 	if _, ok := msg.Payload["text"]; ok {
 		t.Fatalf("payload must not carry legacy 'text' key, got %v", msg.Payload)
 	}
+	if msg.Card == nil {
+		t.Fatal("completed notification must carry structured Summary card fields")
+	}
+	if msg.Card.TaskID != 1 || msg.Card.TaskNo != "TST-1" || msg.Card.Kind != model.NotifyKindCompleted || msg.Card.Title != "今日群聊" {
+		t.Fatalf("unexpected completed card fields: %+v", msg.Card)
+	}
 	// OBO reserved fields must not be present.
 	if payloadHasOBOReserved(msg.Payload) {
 		t.Fatalf("payload leaked OBO reserved field: %v", msg.Payload)
@@ -152,6 +159,10 @@ func TestOnTaskTerminal_FailedCarriesReason(t *testing.T) {
 	text, _ := d.sendCalls[0].Payload["content"].(string)
 	if !strings.Contains(text, "失败") || !strings.Contains(text, "LLM timeout") {
 		t.Fatalf("failed text missing reason: %q", text)
+	}
+	card := d.sendCalls[0].Card
+	if card == nil || card.Kind != model.NotifyKindFailed || card.Reason != "LLM timeout" {
+		t.Fatalf("failed notification must carry the sanitized reason in card fields: %+v", card)
 	}
 }
 
@@ -641,6 +652,43 @@ func TestInternalNotifyDeliverer_PostsToInternalNotify(t *testing.T) {
 	}
 }
 
+// TestInternalNotifyDeliverer_CardModeOmitsPayload locks the cross-repository
+// ingress contract: summary-service sends business fields under `card`, never a
+// caller-authored type-17 payload and never card+payload together.
+func TestInternalNotifyDeliverer_CardModeOmitsPayload(t *testing.T) {
+	var gotRaw map[string]json.RawMessage
+	var gotBody notifyReq
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &gotRaw)
+		_ = json.Unmarshal(body, &gotBody)
+		_ = json.NewEncoder(w).Encode(notifyResp{Delivered: []string{"u1"}})
+	}))
+	defer srv.Close()
+
+	d := NewInternalNotifyDeliverer(srv.URL, "secret-int-token", "https://obsolete.example.com")
+	card := &SummaryCardFields{
+		TaskID: 42, TaskNo: "TN_20260715_abcd", Kind: model.NotifyKindCompleted, Title: "产品周会纪要",
+		TimeRange: "2026-07-14 10:00 ~ 2026-07-15 10:00", Members: 5, MsgCount: 128,
+		GeneratedAt: "2026-07-15 10:05",
+	}
+	msg := SendMessageRequest{
+		ChannelID: "u1", ChannelType: WireChannelDM,
+		Payload: map[string]any{"type": 1, "content": "进程内文本兜底", "space_id": "space-9"},
+		Card:    card,
+	}
+	if err := d.SendMessage(context.Background(), "space-9", msg); err != nil {
+		t.Fatalf("send failed: %v", err)
+	}
+
+	if _, ok := gotRaw["payload"]; ok {
+		t.Fatalf("card mode must omit payload on the wire; body keys=%v", gotRaw)
+	}
+	if gotBody.Card == nil || *gotBody.Card != *card {
+		t.Fatalf("structured card fields changed on the wire: got=%+v want=%+v", gotBody.Card, card)
+	}
+}
+
 // TestInternalNotifyDeliverer_FilteredRecipientReturnsError covers M1: the
 // server returns 200 even when the recipient is filtered out (non-member), with
 // an empty Delivered list. That is a silent drop — SendMessage must turn it into
@@ -811,14 +859,14 @@ func TestBuildText_CompletedIncludesSpaceAndTitle(t *testing.T) {
 func TestBuildText_CompletedIncludesRichMeta(t *testing.T) {
 	db := setupNotifyTestDB(t)
 	// Seed the read-only source tables buildText best-effort queries.
-	if err := db.Exec("CREATE TABLE summary_result (id INTEGER PRIMARY KEY, task_id INTEGER, total_msg_count INTEGER, version INTEGER, generated_at DATETIME)").Error; err != nil {
+	if err := db.Exec("CREATE TABLE summary_result (id INTEGER PRIMARY KEY, task_id INTEGER, total_msg_count INTEGER, version INTEGER, generated_at DATETIME, content TEXT)").Error; err != nil {
 		t.Fatalf("create summary_result: %v", err)
 	}
 	if err := db.Exec("CREATE TABLE summary_participant (id INTEGER PRIMARY KEY, task_id INTEGER)").Error; err != nil {
 		t.Fatalf("create summary_participant: %v", err)
 	}
 	gen := time.Date(2026, 6, 26, 9, 30, 0, 0, timezone.Location())
-	db.Exec("INSERT INTO summary_result (task_id, total_msg_count, version, generated_at) VALUES (?,?,?,?)", 601, 128, 1, gen)
+	db.Exec("INSERT INTO summary_result (task_id, total_msg_count, version, generated_at, content) VALUES (?,?,?,?,?)", 601, 128, 1, gen, "**本周结论**\n\n- 转化率提升 18%\n- 下周继续验证")
 	db.Exec("INSERT INTO summary_participant (task_id) VALUES (?),(?),(?)", 601, 601, 601)
 
 	d := &fakeDeliverer{}
@@ -848,6 +896,23 @@ func TestBuildText_CompletedIncludesRichMeta(t *testing.T) {
 	}
 	if strings.Contains(text, "http://") || strings.Contains(text, "https://") {
 		t.Fatalf("completed text must not carry a link: %q", text)
+	}
+	card := d.sendCalls[0].Card
+	if card == nil {
+		t.Fatal("rich completed notification must include card fields")
+	}
+	if card.TimeRange != "2026-06-25 00:00 ~ 2026-06-25 23:59" || card.Members != 3 || card.MsgCount != 128 || card.GeneratedAt != "2026-06-26 09:30" {
+		t.Fatalf("rich metadata did not map to card fields: %+v", card)
+	}
+	if !strings.Contains(card.Content, "转化率提升 18%") {
+		t.Fatalf("completed card must carry the generated Summary content: %+v", card)
+	}
+}
+
+func TestTruncateSummaryCardContent_BoundsByRunes(t *testing.T) {
+	got := truncateSummaryCardContent(strings.Repeat("总", 7000))
+	if utf8.RuneCountInString(got) != 6000 || !strings.HasSuffix(got, "…") {
+		t.Fatalf("summary card content must be bounded to 6000 runes, got=%d", utf8.RuneCountInString(got))
 	}
 }
 
@@ -1142,7 +1207,6 @@ func TestSweep_RedeliverSanitizesRawError(t *testing.T) {
 	}
 }
 
-
 // ---------------------------------------------------------------------------
 // 轻量防护：接收人非该 space 活跃成员时，deliver 应显式失败，而非静默「已发送」
 // （octo-server 对系统 bot DM 在接收人非成员时会 strip space_id 但仍返 200，
@@ -1256,8 +1320,10 @@ func TestBuildText_NilSanitizerFallsBackToSafeString(t *testing.T) {
 	if !strings.Contains(text, "AI 处理失败，请稍后重试") {
 		t.Fatalf("nil sanitizer fallback must render the safe default; text=%q", text)
 	}
+	if card := d.sendCalls[0].Card; card == nil || card.Reason != "AI 处理失败，请稍后重试" {
+		t.Fatalf("structured card must share the same safe failure sanitizer; card=%+v", card)
+	}
 }
-
 
 // ---------------------------------------------------------------------------
 // by-person 多目标逐人 DM (feat/notify-delivery)
@@ -1570,7 +1636,7 @@ func TestResolveTargets_ByPerson_ExcludesPendingAndDeclined(t *testing.T) {
 	db := setupByPersonDB(t)
 	n := newTestNotifier(db, &fakeDeliverer{}, Config{Enabled: true})
 
-	task := byPersonTask(1010) // creator=user-1, ModeByPerson
+	task := byPersonTask(1010)                                                    // creator=user-1, ModeByPerson
 	seedParticipantStatus(t, db, 1010, "p-pending", model.ParticipantPending)     // 0 -> excluded
 	seedParticipantStatus(t, db, 1010, "p-declined", model.ParticipantDeclined)   // 2 -> excluded
 	seedParticipantStatus(t, db, 1010, "p-accepted", model.ParticipantAccepted)   // 1 -> included
