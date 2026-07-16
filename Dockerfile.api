@@ -1,3 +1,5 @@
+ARG ALPINE_MIRROR=https://mirrors.aliyun.com/alpine
+
 FROM golang:1.25-alpine AS builder
 
 ARG GOPROXY=https://goproxy.cn,direct
@@ -10,8 +12,10 @@ COPY . .
 RUN CGO_ENABLED=0 go build -o /bin/summary-api ./cmd/summary-api
 
 FROM alpine:3.19
+ARG ALPINE_MIRROR
 ENV TZ=Asia/Shanghai
-RUN apk add --no-cache ca-certificates tzdata \
+RUN sed -i "s#https://dl-cdn.alpinelinux.org/alpine#${ALPINE_MIRROR}#g" /etc/apk/repositories \
+    && apk add --no-cache ca-certificates tzdata \
     && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
     && echo $TZ > /etc/timezone
 COPY --from=builder /bin/summary-api /bin/summary-api

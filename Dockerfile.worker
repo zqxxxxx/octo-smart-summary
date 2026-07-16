@@ -1,10 +1,14 @@
+ARG ALPINE_MIRROR=https://mirrors.aliyun.com/alpine
+
 FROM golang:1.25-alpine AS builder
+ARG ALPINE_MIRROR
 
 ARG GOPROXY=https://goproxy.cn,direct
 ENV GOPROXY=${GOPROXY}
 
 # Install build dependencies for CGO
-RUN apk add --no-cache gcc g++ musl-dev curl
+RUN sed -i "s#https://dl-cdn.alpinelinux.org/alpine#${ALPINE_MIRROR}#g" /etc/apk/repositories \
+    && apk add --no-cache gcc g++ musl-dev curl
 
 WORKDIR /app
 COPY go.mod go.sum ./
@@ -32,15 +36,19 @@ RUN go build -o /bin/summary-worker ./cmd/summary-worker
 
 # Download tokenizer models for exact token counting
 FROM alpine:3.19 AS tokenizer-models
-RUN apk add --no-cache curl bash
+ARG ALPINE_MIRROR
+RUN sed -i "s#https://dl-cdn.alpinelinux.org/alpine#${ALPINE_MIRROR}#g" /etc/apk/repositories \
+    && apk add --no-cache curl bash
 WORKDIR /models
 COPY scripts/download_tokenizer_models.sh /scripts/
 ENV TOKENIZER_MODELS_DIR=/models
 RUN /scripts/download_tokenizer_models.sh
 
 FROM alpine:3.19
+ARG ALPINE_MIRROR
 ENV TZ=Asia/Shanghai
-RUN apk add --no-cache ca-certificates tzdata libstdc++ libgcc \
+RUN sed -i "s#https://dl-cdn.alpinelinux.org/alpine#${ALPINE_MIRROR}#g" /etc/apk/repositories \
+    && apk add --no-cache ca-certificates tzdata libstdc++ libgcc \
     && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
     && echo $TZ > /etc/timezone
 COPY --from=builder /bin/summary-worker /bin/summary-worker
