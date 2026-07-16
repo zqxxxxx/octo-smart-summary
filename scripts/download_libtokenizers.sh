@@ -2,7 +2,7 @@
 set -eu
 
 output_dir=${1:-/usr/local/lib}
-chunk_size=1048576
+chunk_size=262144
 arch=$(uname -m)
 
 case "$arch" in
@@ -40,8 +40,8 @@ while [ "$start" -lt "$asset_size" ]; do
   attempt=1
   while :; do
     rm -f "$part"
-    if curl -fLsS --retry 3 --retry-all-errors --retry-delay 1 \
-      --connect-timeout 20 --max-time 60 --range "${start}-${end}" \
+    if curl -fLsS --connect-timeout 20 --max-time 45 \
+      --range "${start}-${end}" \
       --output "$part" "$asset_url"; then
       actual=$(wc -c < "$part" | tr -d ' ')
       if [ "$actual" = "$expected" ]; then
