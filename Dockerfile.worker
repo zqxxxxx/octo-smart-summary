@@ -1,5 +1,8 @@
 FROM golang:1.25-alpine AS builder
 
+ARG GOPROXY=https://goproxy.cn,direct
+ENV GOPROXY=${GOPROXY}
+
 # Install build dependencies for CGO
 RUN apk add --no-cache gcc g++ musl-dev curl
 
