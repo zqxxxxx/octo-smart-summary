@@ -57,13 +57,13 @@ download_file() {
     local output="$3"
     local max_retries=3
     
-    # For large files (tokenizer.json, tiktoken.model), prefer mirror
-    # For small files (tokenizer_config.json), try original first
+    # Prefer the mirror for every artifact. The official endpoint remains a
+    # fallback because it is often unreachable from the deployment network.
     local urls
     if [[ "$file" == "tokenizer_config.json" ]]; then
         urls=(
-            "https://huggingface.co/$repo/raw/main/$file"
             "https://hf-mirror.com/$repo/raw/main/$file"
+            "https://huggingface.co/$repo/raw/main/$file"
         )
     else
         urls=(

@@ -21,12 +21,20 @@ SHELL ["/bin/ash", "-o", "pipefail", "-c"]
 RUN ARCH=$(uname -m) && \
     if [ "$ARCH" = "x86_64" ]; then \
         LIBTOK_ARCH="amd64"; \
+        LIBTOK_SHA256="8043d2f258b2f4d84d2bef6868e2b971a37b9979afb9000965b38bce706d52d4"; \
     elif [ "$ARCH" = "aarch64" ]; then \
         LIBTOK_ARCH="arm64"; \
+        LIBTOK_SHA256="8c64d719b7b35d824b7e2ff7fc8c2c49eca806169c11ea71a9c494e909a76399"; \
     else \
         echo "Unsupported architecture: $ARCH" && exit 1; \
     fi && \
-    curl -fsSL "https://github.com/daulet/tokenizers/releases/download/v1.27.0/libtokenizers.linux-musl-${LIBTOK_ARCH}.tar.gz" | tar xz && \
+    LIBTOK_ARCHIVE="/tmp/libtokenizers.linux-musl-${LIBTOK_ARCH}.tar.gz" && \
+    curl -fL --retry 8 --retry-all-errors --retry-delay 2 \
+        --connect-timeout 30 --max-time 600 --continue-at - \
+        -o "$LIBTOK_ARCHIVE" \
+        "https://github.com/daulet/tokenizers/releases/download/v1.27.0/libtokenizers.linux-musl-${LIBTOK_ARCH}.tar.gz" && \
+    echo "$LIBTOK_SHA256  $LIBTOK_ARCHIVE" | sha256sum -c - && \
+    tar -xzf "$LIBTOK_ARCHIVE" && \
     mv libtokenizers.a /usr/local/lib/
 
 # Build with CGO enabled for exact tokenizer (Qwen/DeepSeek)
